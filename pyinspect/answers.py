@@ -1,199 +1,140 @@
-from googlesearch import search as gsearch
-import click
-from pathlib import Path
-from rich.text import Text
-from rich.panel import Panel
+from rich.columns import Columns
+from bs4 import BeautifulSoup
+import requests
 
-from pyinspect._colors import salmon, lightgray, white, lightsalmon, lightblue
-from pyinspect.utils import warn_on_no_connection, _class_name
-from pyinspect.panels import warn
-from pyinspect._answers import (
-    _get_link_so_top_answer,
-    _parse_so_top_answer,
-    ls,
-)
+from pyinspect.panels import warn, Report
 from pyinspect._rich import console
+from pyinspect._colors import (
+    lightblue,
+    lightlilla,
+    lightsalmon,
+    lightgray,
+    mocassin,
+)
 
-# Make a base folder for pyinspect
-base_dir = Path.home() / ".pyinspect"
-base_dir.mkdir(exist_ok=True)
-
-error_cache = base_dir / "error_cache.txt"
-
-# Get other vars
+SO_url = "https://stackoverflow.com"
+ls = f"bold {lightgray}"  # link style
 
 
-def cache_error(msg, doc):
+def _highlight_link(query, url, website=""):
     """
-    Saves a string with an error message to file
-    so that it can later be used to google the
-    error
+    Highlights the part of a link corresponding to a search query
+
+    :param query: str, search query
+    :param url: str, link.
     """
-    with open(str(error_cache), "w") as f:
-        f.writelines(msg + "-x-" + doc)
+    if query not in url:
+        q = query.lower()
+        q = q.replace(":", "").replace(" ", "-")
+    else:
+        q = query
+
+    for string, color in zip((website, q), (lightlilla, lightblue)):
+        try:
+            before, after = url.split(string)
+            url = before + f"[{color}]{string}[/{color}]" + after
+        except ValueError:
+            return url
+    return url
 
 
-def load_cached():
+def _get_link_so_top_answer(query):
     """
-    Loads a cached error message
+    Searches SO for answers given a query and sorts by relevance.
+    returns the link to the best answer and to the list of all answers.
+
+    :param query: str, search query
     """
-    with open(str(error_cache), "r") as f:
-        txt = f.read()
-    return txt.split("-x-")
+    # get search string
+    params = f"q=python {query}&sort=relevance"
+    search_url = SO_url + "/search?" + params
+
+    # query SO
+    res = requests.get(search_url)
+    if not res.ok:
+        return None, search_url
+
+    # get link to top anser
+    bs = BeautifulSoup(res.content, features="html.parser")
+    link = bs.find("a", attrs={"class": "question-hyperlink"})
+
+    if link is None:
+        return None, search_url
+    else:
+        return SO_url + link.get("href"), search_url
 
 
-def get_stackoverflow(query):
+def _style_so_element(obj, name=None, color="white"):
     """
-    Prints the results of interrogating SO
-    with a search query (str).
-    """
-    # get link to top question
-    questionlink, search_url = _get_link_so_top_answer(query)
+    # Given a bs4 obj with the html elements of a question or
+    answer from a SO page, this function returns a nicely
+    formatted Panel
 
-    if questionlink is None:
+    :param obj: bs4 element
+    :param name: str, optional. Panel title
+    :param color: optional. Panel endge color
+    """
+    body = obj.find("div", attrs={"class": "s-prose js-post-body"})
+
+    rep = Report(name, color=color, accent=color, dim=color)
+
+    for child in body.children:
+        if child.name is None:
+            continue
+
+        if "pre" in child.name:
+            rep.add(child.text, "code")
+            rep.add("")
+        elif "p" in child.name:
+            rep.add("[bold]" + child.text)
+            rep.add("")
+
+    return rep
+
+
+def _parse_so_top_answer(url):
+    """
+    Parses a link to a SO question
+    to return the formatted text of the question and top answer
+    """
+    # get content
+    res = requests.get(url)
+    if not res.ok:
+        return None
+
+    # get question and answer
+    console.print("[white]Parsing SO answer...")
+    bs = BeautifulSoup(res.content, features="html.parser")
+
+    question = bs.find("div", attrs={"class": "question"})
+    answer = bs.find("div", attrs={"class": "answer"})
+
+    if answer is None or question is None:
         warn(
-            "Failed to find anything on stack overflow, sorry.",
-            "While parsing the URL with the top SO answer, could not detect any answer. Nothing to report",
+            "Failed to parse SO answer",
+            f"We tried to parse the SO question but failed...",
         )
         return
 
-    _parse_so_top_answer(questionlink)
-
-    out = Text.from_markup(
-        f"""
-[{white}]Link to top [{lightsalmon}]Stack Overflow[/{lightsalmon}] question for the error:
-        [{ls}]{questionlink}[/{ls}]
-
-[{white}]To find more related answers on [{lightsalmon}]Stack Overflow[/{lightsalmon}], visit:
-        [{ls}]{search_url}[/{ls}]
-"""
-    )
-
-    console.print(out)
-
-
-def get_google(
-    query, n_answers=3, best_so=False, mute=False, break_on_best=False
-):
-    """
-    Prints links to the top hits on google given a search query (str)
-    and returns a link to the top one.
-
-    :param query: str, search query
-    :param n_answers: int, number of max results to get
-    :param best_so: bool, False. If true the 'best' result must be from SO
-    :param mute: bool, False. If true the it doesn't print the results
-    :param break_on_best: bool, False. If true the it stops after finding the best answer
-    """
-    out = [
-        f"[{white}]Links to the top 3 results on [{lightsalmon}]google.com[/{lightsalmon}] for the error:\n"
-    ]
-
-    best = None
-    for n, j in enumerate(
-        gsearch(
-            "python " + query,
-            tld="co.in",
-            num=n_answers,
-            stop=n_answers,
-            pause=0.3,
-        )
+    # Print as nicely formatted panels
+    panels = []
+    for name, obj, color in zip(
+        ["Question", "Answer"], [question, answer], [lightsalmon, lightblue]
     ):
-        out.append(f"        [{ls}]{j}[/{ls}]\n")
+        panels.append(_style_so_element(obj, name, color))
 
-        if best is None:
-            if not best_so or "stackoverflow" in j:
-                best = j
-
-                if break_on_best:
-                    break
-
-    if not mute:
-        console.print(*out, "\n")
-    return best
-
-
-@warn_on_no_connection
-def ask(query):
-    """
-    Got a question? Google it!
-    Looks on google for a hit from stack overflow matching a search query
-    and prints it out nicely formatted
-    """
-    if not isinstance(query, str):
-        raise ValueError(
-            f"Search query must be a string, not {_class_name(query)}"
-        )
-    answer = get_google(
-        query, n_answers=10, best_so=True, mute=True, break_on_best=True
-    )
-
-    if answer is not None:
-        _parse_so_top_answer(answer)
-
+    if panels:
         console.print(
-            f"\nTo continue reading about this question, head to: [{lightblue}]{answer}\n"
+            f"[{mocassin}]\n\nAnswer to the top [i]Stack Overflow[/i] answer for your question.",
+            Columns(
+                panels,
+                equal=True,
+                width=88,
+            ),
+            sep="\n",
         )
     else:
         warn(
-            "Failed to get a SO",
-            f"Looked on google for {query}, but didn't find a Stack Overflow answer, sorry.",
+            "Failed to find answer on the SO page",
+            "While parsing the URL with the top SO answer, could not detect any answer. Nothing to report",
         )
-
-
-@warn_on_no_connection
-def get_answers(hide_panel=False):
-    """
-    Looks for solution to the last error encountered (as cached).
-    Prints the error message, it's meaning and links
-    to possible answers on google and stack overflow.
-    It also parses the question and first answer from the top hit from
-    google if that's a link to a SO page.
-
-    :param hide_panel: bool, False. If true the panel with
-        the error message is hidden
-    """
-    try:
-        query, msg = load_cached()
-    except ValueError:
-        warn(
-            "Failed to load cached error.",
-            "This could be because no error had been cached, or it could be a bug",
-        )
-
-    # show a panel with a recap of the error message
-    if not hide_panel:
-        out = f"""
-    [bold {white}]Searching online for solutions to:
-
-            [bold {white}]>[/bold {white}] [bold {salmon}]{query}",
-            [bold {white}]>[/bold {white}]
-            [bold {white}]>[/bold {white}]    [{salmon}]{query.split(":")[0]}:[/{salmon}][{lightgray}] {msg}',
-            """
-
-        panel = Panel.fit(
-            Text.from_markup(out),
-            padding=(1, 2),
-            border_style=salmon,
-        )
-        console.print(panel)
-    else:
-        console.print("\n")
-
-    # ask google and stack overflow
-    best_answer = get_google(query)
-    # get_stackoverflow(query)
-
-    if "stackoverflow" in best_answer:
-        _parse_so_top_answer(best_answer)
-
-
-@click.command()
-def cli_get_answers():
-    get_answers()
-
-
-@click.command()
-@click.argument("query")
-def cli_ask(query):
-    ask(query)
